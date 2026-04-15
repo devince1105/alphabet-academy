@@ -5,6 +5,7 @@ import { AlphabetEntry } from "@/types/alphabet";
 import AudioButton from "./AudioButton";
 import DrawingCanvas, { DrawingCanvasHandle } from "./DrawingCanvas";
 import { speakPraise } from "@/lib/audio";
+import { ScoreResult, ZERO_SCORE } from "@/lib/scoring";
 
 interface AlphabetCardProps {
   entry: AlphabetEntry;
@@ -13,7 +14,7 @@ interface AlphabetCardProps {
   onRedraw: () => void;
   onDone: (score?: number, starCount?: number) => void;
   onNext: () => void;
-  onLiveMetrics?: (metrics: { coverage: number; accuracy: number }) => void;
+  onLiveMetrics?: (result: ScoreResult) => void;
 }
 
 export default function AlphabetCard({
@@ -26,44 +27,37 @@ export default function AlphabetCard({
   onLiveMetrics,
 }: AlphabetCardProps) {
   const canvasRef = useRef<DrawingCanvasHandle>(null);
-  const [metrics, setMetrics] = useState<{ coverage: number; accuracy: number } | null>(null);
 
-  const starCount = metrics
-    ? (
-      (metrics.coverage >= 40 && metrics.accuracy >= 45) || (metrics.coverage >= 15 && metrics.accuracy >= 80)
-        ? 3
-        : (metrics.coverage >= 10 && metrics.accuracy >= 25)
-          ? 2
-          : 1
-    )
-    : 0;
+  // ScoreResult from the scoring engine — null means the user hasn't tapped "好了" yet.
+  const [scoreResult, setScoreResult] = useState<ScoreResult | null>(null);
 
+  // Star count lives on ScoreResult; no local re-computation needed.
+  const starCount: 0 | 1 | 2 | 3 = scoreResult?.stars ?? 0;
+
+  // Speak praise and emit a debug log whenever a result is committed.
   useEffect(() => {
-    if (metrics) {
-      speakPraise(starCount);
+    if (scoreResult) {
+      console.log("[AlphabetCard] committed score", {
+        finalScore:   scoreResult.finalScore,
+        overlapRatio: scoreResult.overlapRatio,
+        precision:    scoreResult.precision,
+        recall:       scoreResult.recall,
+        stars:        scoreResult.stars,
+      });
+      speakPraise(scoreResult.stars);
     }
-  }, [metrics, starCount]);
+  }, [scoreResult]);
 
   const handleDone = () => {
-    if (canvasRef.current) {
-      const m = canvasRef.current.getMetrics();
-      setMetrics(m);
-      const sc =
-        (m.coverage >= 40 && m.accuracy >= 45) || (m.coverage >= 15 && m.accuracy >= 80)
-          ? 3
-          : (m.coverage >= 10 && m.accuracy >= 25)
-          ? 2
-          : 1;
-      onDone((m.coverage + m.accuracy) / 2, sc);
-    } else {
-      onDone();
-    }
+    const result = canvasRef.current?.getMetrics() ?? ZERO_SCORE;
+    setScoreResult(result);
+    onDone(result.finalScore, result.stars);
   };
 
   const handleRedraw = () => {
     canvasRef.current?.clear();
-    setMetrics(null);
-    onLiveMetrics?.({ coverage: 0, accuracy: 0 });
+    setScoreResult(null);
+    onLiveMetrics?.(ZERO_SCORE);
     onRedraw();
   };
 
@@ -87,24 +81,40 @@ export default function AlphabetCard({
               ref={canvasRef}
               letter={letterCase === "upper" ? entry.letter : entry.lowercase}
               strokeWidth={26}
-              showGuide={!metrics}
+              showGuide={!scoreResult}
               onMetricsUpdate={onLiveMetrics}
             />
           </div>
 
-          {/* Score Overlay — covers the canvas */}
-          {metrics !== null && (
-            <div className="absolute left-3 right-3 bottom-3 bg-white border border-indigo-100 rounded-[2rem] animate-slideUp z-30 p-6 shadow-[0_8px_40px_rgba(79,70,229,0.12)] flex flex-col items-center text-center">
-              <div className="flex gap-3 mb-2 justify-center">
-                {[1, 2, 3].map((star) => (
-                  <div key={star} className={`text-4xl transition-all duration-500 ${star <= starCount ? "scale-110 drop-shadow-md" : "grayscale opacity-15 scale-90"}`}>
+          {/* Score Overlay — covers the canvas after "好了" is tapped */}
+          {scoreResult !== null && (
+            <div className="absolute left-3 right-3 bottom-3 bg-white border border-indigo-100 rounded-[2rem] animate-slideUp z-30 p-5 shadow-[0_8px_40px_rgba(79,70,229,0.12)] flex flex-col items-center text-center gap-3">
+
+              {/* Stars */}
+              <div className="flex gap-3 justify-center">
+                {([1, 2, 3] as const).map((star) => (
+                  <div
+                    key={star}
+                    className={`text-4xl transition-all duration-500 ${
+                      star <= starCount
+                        ? "scale-110 drop-shadow-md"
+                        : "grayscale opacity-15 scale-90"
+                    }`}
+                  >
                     ⭐
                   </div>
                 ))}
               </div>
 
-              <h3 className="text-xl font-black text-slate-800 mb-4 tracking-tight">
-                {starCount === 3 ? "三顆星！" : starCount === 2 ? "兩顆星！" : "再加油！"}
+              {/* Headline */}
+              <h3 className="text-xl font-black text-slate-800 tracking-tight leading-tight">
+                {starCount === 3
+                  ? "完美！三顆星 🎉"
+                  : starCount === 2
+                  ? "不錯！兩顆星 👍"
+                  : starCount === 1
+                  ? "繼續加油！⭐"
+                  : "再試一次！✏️"}
               </h3>
 
               <div className="flex gap-3 w-full justify-center">

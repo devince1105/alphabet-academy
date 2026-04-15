@@ -1,31 +1,21 @@
 "use client";
 
 import React, { useRef, useEffect, useState, useImperativeHandle, forwardRef, useCallback } from "react";
+import { ScoreResult, ZERO_SCORE, calculateScore } from "@/lib/scoring";
 
 interface DrawingCanvasProps {
   letter: string;
   fontSize?: number;
   strokeWidth?: number;
   showGuide?: boolean;
-  onMetricsUpdate?: (metrics: { coverage: number; accuracy: number }) => void;
+  onMetricsUpdate?: (result: ScoreResult) => void;
 }
 
 export interface DrawingCanvasHandle {
   clear: () => void;
-  getMetrics: () => { coverage: number; accuracy: number };
+  getMetrics: () => ScoreResult;
 }
 
-// Standard print manuscript stroke counts per letter
-const STROKE_COUNTS: Record<string, number> = {
-  // Uppercase
-  A: 3, B: 2, C: 1, D: 2, E: 4, F: 3, G: 2, H: 3, I: 1, J: 2,
-  K: 3, L: 2, M: 4, N: 3, O: 1, P: 2, Q: 2, R: 3, S: 1, T: 2,
-  U: 1, V: 2, W: 4, X: 2, Y: 3, Z: 3,
-  // Lowercase
-  a: 2, b: 2, c: 1, d: 2, e: 1, f: 2, g: 2, h: 2, i: 2, j: 2,
-  k: 3, l: 1, m: 3, n: 2, o: 1, p: 2, q: 2, r: 2, s: 1, t: 2,
-  u: 1, v: 2, w: 4, x: 2, y: 2, z: 3,
-};
 
 const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>(
   ({ letter, fontSize = 220, strokeWidth = 14, showGuide = true, onMetricsUpdate }, ref) => {
@@ -79,7 +69,7 @@ const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>(
 
       // Broaden hit area with thick stroke (child-friendly tolerance)
       tCtx.strokeStyle = "#000";
-      tCtx.lineWidth = 80;
+      tCtx.lineWidth = 20;
       tCtx.lineJoin = "round";
       tCtx.strokeText(letter, rect.width / 2, rect.height / 2);
 
@@ -125,36 +115,26 @@ const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>(
       buildTemplate();
     }, [buildTemplate]);
 
-    const computeMetrics = () => {
-      const canvas = canvasRef.current;
+    const computeMetrics = (): ScoreResult => {
+      // Early exit — nothing drawn yet
+      if (strokeCountRef.current === 0) return ZERO_SCORE;
+
+      const canvas  = canvasRef.current;
       const tCanvas = templateCanvasRef.current;
-      if (!canvas || !tCanvas) return { coverage: 0, accuracy: 0 };
-      const ctx = canvas.getContext("2d");
+      if (!canvas || !tCanvas) return ZERO_SCORE;
+
+      const ctx  = canvas.getContext("2d");
       const tCtx = tCanvas.getContext("2d");
-      if (!ctx || !tCtx) return { coverage: 0, accuracy: 0 };
+      if (!ctx || !tCtx) return ZERO_SCORE;
 
-      // Coverage = stroke-count based (each pen-lift = 1 stroke)
-      const expected = STROKE_COUNTS[letter] ?? 3;
-      const drawn = strokeCountRef.current;
-      const coverage = Math.min(100, Math.round((drawn / expected) * 100));
+      const { width, height } = canvas;
 
-      // Accuracy = pixel-based: how much of drawn strokes land on template
-      const width = canvas.width;
-      const height = canvas.height;
-      const userImg = ctx.getImageData(0, 0, width, height).data;
-      const templateImg = tCtx.getImageData(0, 0, width, height).data;
+      // Read both canvases into ImageData and delegate to the scoring engine.
+      // getImageData forces a GPU→CPU readback; unavoidable for pixel scoring.
+      const userImageData   = ctx.getImageData(0, 0, width, height);
+      const targetImageData = tCtx.getImageData(0, 0, width, height);
 
-      let drawnOnTemplate = 0;
-      let drawnTotal = 0;
-      for (let i = 3; i < userImg.length; i += 4) {
-        if (userImg[i] > 10) {
-          drawnTotal++;
-          if (templateImg[i] > 10) drawnOnTemplate++;
-        }
-      }
-      const accuracy = drawnTotal === 0 ? 0 : Math.min(100, Math.round((drawnOnTemplate / drawnTotal) * 100));
-
-      return { coverage, accuracy };
+      return calculateScore(targetImageData, userImageData);
     };
 
     useImperativeHandle(ref, () => ({

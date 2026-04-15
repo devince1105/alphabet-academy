@@ -7,6 +7,7 @@ import AlphabetCard from "@/components/AlphabetCard";
 import Keyboard from "@/components/Keyboard";
 import ProgressBar from "@/components/ProgressBar";
 import { speakLetterAndWord } from "@/lib/audio";
+import { ScoreResult, ZERO_SCORE } from "@/lib/scoring";
 
 type AnswerState = "correct" | "incorrect" | "idle";
 
@@ -41,7 +42,7 @@ export default function AlphabetPage() {
     new Set()
   );
   const [starredLetters, setStarredLetters] = useState<Set<string>>(new Set());
-  const [liveMetrics, setLiveMetrics] = useState({ coverage: 0, accuracy: 0 });
+  const [liveMetrics, setLiveMetrics] = useState<ScoreResult>(ZERO_SCORE);
 
   // Challenge mode UI state
   const [lastSelected, setLastSelected] = useState<string | null>(null);
@@ -100,7 +101,7 @@ export default function AlphabetPage() {
     setLastSelected(null);
     setAnswerState("idle");
     setKeyboardDisabled(false);
-    setLiveMetrics({ coverage: 0, accuracy: 0 });
+    setLiveMetrics(ZERO_SCORE);
 
     // Auto speak next
     const nextItem = deck[(index + 1) % deck.length];
@@ -109,7 +110,8 @@ export default function AlphabetPage() {
 
   const handleDone = (score?: number, starCount?: number) => {
     setTotalAttempts((n) => n + 1);
-    if (score !== undefined && score >= 20) {
+    // Count as correct only when the user earns at least 1 star (finalScore >= 50)
+    if (score !== undefined && score >= 50) {
       setCorrectCount((n) => n + 1);
     }
     setCompletedLetters((prev) => {
@@ -312,10 +314,10 @@ export default function AlphabetPage() {
         {/* ── Progress ───────────────────────────────────────── */}
         <div className="w-full bg-white p-4 rounded-3xl border border-slate-100 shadow-sm">
           <ProgressBar
+            coverage={Math.round(liveMetrics.overlapRatio * 100)}
+            accuracy={Math.round(liveMetrics.precision * 100)}
             current={completedLetters.size}
             total={allData.length}
-            coverage={liveMetrics.coverage}
-            accuracy={liveMetrics.accuracy}
           />
         </div>
 
