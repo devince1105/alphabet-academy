@@ -108,23 +108,25 @@ export default function AlphabetPage() {
     if (nextItem) speakLetterAndWord(nextItem.letter, nextItem.word);
   }, [deck, index, mode]);
 
-  const handleDone = (score?: number, starCount?: number) => {
+  const handleDone = (_score?: number, starCount?: number) => {
     setTotalAttempts((n) => n + 1);
-    // Count as correct only when the user earns at least 1 star (finalScore >= 50)
-    if (score !== undefined && score >= 50) {
+    // Two or more stars means the letter was learned successfully.
+    if (starCount !== undefined && starCount >= 2) {
       setCorrectCount((n) => n + 1);
     }
-    setCompletedLetters((prev) => {
-      const next = new Set(prev);
-      const activeLetter = letterCase === "upper" ? current.letter : current.lowercase;
-      next.add(activeLetter);
-      return next;
-    });
+    if (starCount !== undefined && starCount >= 1) {
+      setCompletedLetters((prev) => {
+        const next = new Set(prev);
+        // Completion is shared by upper/lower case so progress stays out of 26.
+        next.add(current.letter);
+        return next;
+      });
+    }
     if (starCount === 3) {
       setStarredLetters((prev) => {
         const next = new Set(prev);
-        const activeLetter = letterCase === "upper" ? current.letter : current.lowercase;
-        next.add(activeLetter);
+        next.add(current.letter);
+        next.add(current.lowercase);
         return next;
       });
     }
@@ -316,6 +318,15 @@ export default function AlphabetPage() {
           <ProgressBar
             coverage={Math.round(liveMetrics.overlapRatio * 100)}
             accuracy={Math.round(liveMetrics.precision * 100)}
+            wrongArea={Math.round(liveMetrics.wrongAreaRatio * 100)}
+            overflow={Math.round(liveMetrics.outsideBoxRatio * 100)}
+            inkRatio={Math.round(liveMetrics.inkRatio * 100)}
+            trajectoryQuality={Math.round(
+              (liveMetrics.trajectory?.quality ?? 0) * 100
+            )}
+            directionStructure={Math.round(
+              (liveMetrics.trajectory?.directionStructure ?? 0) * 100
+            )}
             current={completedLetters.size}
             total={allData.length}
           />

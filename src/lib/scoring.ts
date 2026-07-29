@@ -1,3 +1,5 @@
+import type { TrajectoryMetrics } from "./trajectory";
+
 /**
  * ============================================================================
  * Handwriting Scoring Engine
@@ -8,11 +10,10 @@
  *
  *  METRIC           FORMULA                          WEIGHT  ROLE
  *  ─────────────── ─────────────────────────────── ──────── ───────────────
- *  Overlap Ratio   overlapPixels / targetPixels      50 %    Primary accuracy
- *  Precision       overlapPixels / userPixels        30 %    Anti-cheat gate
- *  Recall          overlapPixels / targetPixels      20 %    Completeness
+ *  Coverage        target ∩ tolerant-user / target   65 %    Completeness
+ *  Precision       user ∩ tolerant-target / user     35 %    Stroke accuracy
  *
- *  finalScore = (overlapRatio×0.5 + precision×0.3 + recall×0.2) × 100
+ *  finalScore = (coverage×0.65 + precision×0.35) × bboxPenalty × 100
  *
  * Bonus features
  *  ─ Morphological dilation  O(n) sliding-window pass on the user bitmap,
@@ -43,6 +44,12 @@ export type ScoreResult = {
   overlapPixels: number;
   /** Fraction of raw user pixels that fell outside the template bounding box */
   outsideBoxRatio: number;
+  /** Raw user ink relative to the template area (1 = same pixel area) */
+  inkRatio: number;
+  /** Raw user pixels outside the tolerant letter shape (0–1) */
+  wrongAreaRatio: number;
+  /** Motion-based handwriting diagnostics; null before trajectory capture */
+  trajectory: TrajectoryMetrics | null;
 };
 
 /** Canonical zero result — returned for empty drawing or missing canvas data */
@@ -56,6 +63,9 @@ export const ZERO_SCORE: ScoreResult = {
   userPixels:      0,
   overlapPixels:   0,
   outsideBoxRatio: 0,
+  inkRatio:        0,
+  wrongAreaRatio:  0,
+  trajectory:      null,
 };
 
 // ─── Tuning constants ─────────────────────────────────────────────────────────
@@ -69,21 +79,18 @@ export const ZERO_SCORE: ScoreResult = {
 const ALPHA_THRESHOLD = 128;
 
 /**
- * Dilation radius in physical canvas pixels.
- * Expands each user pixel outward before counting overlap, providing
- * positional tolerance for slightly offset but recognisable strokes.
- * Increasing this makes scoring more lenient.
- * ── Children's setting: 14 (generous tolerance for small-hand motor skills) ──
+ * Tolerance radius as a fraction of the canvas's shorter edge.
+ * Scaling with the bitmap keeps the effective tolerance stable across DPRs.
  */
-const DILATION_RADIUS = 14;
+const TOLERANCE_RATIO = 0.018;
 
 /**
  * Maximum fraction of finalScore that the bounding-box penalty can remove.
  * At outsideBoxRatio = 1 (all pixels outside bbox), score is reduced by
  * BBOX_PENALTY_WEIGHT × 100 %. Set to 0 to disable.
- * ── Children's setting: 0.1 (kids naturally draw outside the lines) ──
+ * ── Children's setting: 0.18 (still forgiving of normal overshoot) ──
  */
-const BBOX_PENALTY_WEIGHT = 0.1;
+const BBOX_PENALTY_WEIGHT = 0.18;
 
 // ─── Internal helpers ─────────────────────────────────────────────────────────
 
@@ -195,7 +202,7 @@ function getBoundingBox(
  *
  * Algorithm steps:
  *   1. Binarize both bitmaps with alpha > 128 threshold
- *   2. Dilate the user bitmap (tolerance for slight offsets)
+ *   2. Dilate user and target bitmaps (bidirectional positional tolerance)
  *   3. Compute bounding box of template for penalty calculation
  *   4. Single-pass pixel counting: targetPixels, userPixels, overlapPixels
  *   5. Derive overlapRatio, precision, recall
@@ -211,9 +218,19 @@ function getBoundingBox(
 export function calculateScore(
   targetImageData: ImageData,
   userImageData: ImageData,
+  trajectory: TrajectoryMetrics | null = null,
 ): ScoreResult {
   const width  = targetImageData.width;
   const height = targetImageData.height;
+
+  if (
+    userImageData.width !== width ||
+    userImageData.height !== height ||
+    targetImageData.data.length !== userImageData.data.length
+  ) {
+    console.warn("[scoring] target and user canvas dimensions do not match");
+    return ZERO_SCORE;
+  }
 
   // ── 1. Binarize ────────────────────────────────────────────────────────────
   const { bitmap: targetBitmap, total: targetTotal } = toBinaryBitmap(targetImageData.data);
@@ -230,33 +247,48 @@ export function calculateScore(
     return ZERO_SCORE;
   }
 
-  // ── 2. Dilate user bitmap ──────────────────────────────────────────────────
-  // The dilated bitmap is used for overlap / userPixels counting so that
-  // strokes slightly outside the template edge still contribute.
-  // The raw bitmap is kept for bounding-box penalty (dilation would
-  // artificially expand outside-box measurements).
-  const userBitmap = dilate(userBitmapRaw, width, height, DILATION_RADIUS);
+  // Scale tolerance with the bitmap instead of using a fixed physical-pixel
+  // radius. This keeps scoring consistent between standard and Retina screens.
+  // 1.8% of the shorter edge is deliberately forgiving for young learners.
+  const toleranceRadius = Math.max(
+    2,
+    Math.round(Math.min(width, height) * TOLERANCE_RATIO),
+  );
+  const tolerantUserBitmap = dilate(
+    userBitmapRaw,
+    width,
+    height,
+    toleranceRadius,
+  );
+  const tolerantTargetBitmap = dilate(
+    targetBitmap,
+    width,
+    height,
+    toleranceRadius,
+  );
 
   // ── 3. Template bounding box ───────────────────────────────────────────────
   const bbox = getBoundingBox(targetBitmap, width, height);
 
   // ── 4. Single-pass pixel counting ─────────────────────────────────────────
   let targetPixels  = 0; // on-pixels in template
-  let userPixels    = 0; // on-pixels in dilated user drawing
-  let overlapPixels = 0; // dilated-user ∩ template
+  let userPixels    = 0; // on-pixels in raw user drawing
+  let overlapPixels = 0; // tolerant-user ∩ template (coverage numerator)
+  let accurateUserPixels = 0; // raw-user ∩ tolerant-template
   let outsideBox    = 0; // raw-user pixels outside template bbox
 
   for (let i = 0, len = width * height; i < len; i++) {
     const isTarget  = targetBitmap[i]  === 1;
-    const isUser    = userBitmap[i]    === 1; // dilated
-    const isUserRaw = userBitmapRaw[i] === 1; // original (for penalty only)
+    const isTolerantUser = tolerantUserBitmap[i] === 1;
+    const isTolerantTarget = tolerantTargetBitmap[i] === 1;
+    const isUserRaw = userBitmapRaw[i] === 1;
 
     if (isTarget) targetPixels++;
-
-    if (isUser) {
+    if (isUserRaw) {
       userPixels++;
-      if (isTarget) overlapPixels++;
+      if (isTolerantTarget) accurateUserPixels++;
     }
+    if (isTarget && isTolerantUser) overlapPixels++;
 
     // Bounding-box penalty: count raw user pixels that fall outside bbox
     if (bbox && isUserRaw) {
@@ -276,9 +308,12 @@ export function calculateScore(
 
   // Precision — ANTI-CHEAT: "What fraction of the user's drawing is correct?"
   // Scribbling everywhere → userPixels grows → precision shrinks.
-  // userPixels = 0 guard: dilated user can only be empty if raw was empty
-  // (which is caught by userRawTotal === 0 guard above).
-  const precision = userPixels === 0 ? 0 : overlapPixels / userPixels;
+  // userPixels = 0 is already covered by the raw-user guard above.
+  const precision =
+    userPixels === 0 ? 0 : accurateUserPixels / userPixels;
+  // Unlike outsideBoxRatio, this also catches ink in empty areas *inside* the
+  // letter's bounding box (for example horizontal scribbles through an A).
+  const wrongAreaRatio = 1 - precision;
 
   // Recall — COMPLETENESS: same as overlapRatio, kept separate for weight
   // flexibility (e.g. future per-letter weighting).
@@ -286,18 +321,9 @@ export function calculateScore(
 
   // ── 6. Weighted score ──────────────────────────────────────────────────────
   //
-  //   overlapRatio × 0.5   primary completeness signal
-  //   precision    × 0.3   penalises imprecise or excessive strokes
-  //   recall       × 0.2   reinforces completeness
-  //
-  // Note: since recall ≡ overlapRatio, this simplifies algebraically to
-  //   (overlapRatio × 0.7 + precision × 0.3), but the three-term form is
-  //   intentionally preserved so future non-trivial recall definitions
-  //   (e.g. stroke-order weighting) slot in without changing the formula.
-  const rawScore =
-    overlapRatio * 0.5 +
-    precision    * 0.3 +
-    recall       * 0.2;
+  // Coverage is weighted higher so a child's recognizable, slightly wobbly
+  // attempt is rewarded. Precision prevents full-canvas scribbling from passing.
+  const rawScore = overlapRatio * 0.65 + precision * 0.35;
 
   // ── 7. Bounding-box penalty ────────────────────────────────────────────────
   // outsideBoxRatio = fraction of the user's raw strokes outside the bbox.
@@ -307,24 +333,74 @@ export function calculateScore(
   const outsideBoxRatio = userRawTotal === 0 ? 0 : outsideBox / userRawTotal;
   const penaltyFactor   = 1 - outsideBoxRatio * BBOX_PENALTY_WEIGHT;
 
+  // Excess ink is a useful scribble signal that coverage alone cannot catch.
+  // Normal tracing usually uses less ink than the filled template. The penalty
+  // starts only after 115% so retracing and children's naturally thick strokes
+  // are not punished.
+  const inkRatio = userPixels / targetPixels;
+  const excessInk = Math.max(0, inkRatio - 1.15);
+  const excessInkFactor = Math.max(0.35, 1 - excessInk * 0.45);
+  // Wrong-area ink is an explicit negative signal and cannot be cancelled out
+  // by high coverage. The tolerant target has already forgiven normal wobble.
+  const wrongAreaPenaltyFactor = Math.max(
+    0.15,
+    1 - Math.pow(wrongAreaRatio, 1.15) * 1.15,
+  );
+  const trajectoryFactor =
+    trajectory === null ? 1 : 0.7 + trajectory.quality * 0.3;
+
   // ── 8. Normalize, apply penalty, clamp, floor ─────────────────────────────
   // Math.floor prevents a rawScore of 0.899 from reaching 90 (3-star threshold).
   // This is intentionally strict — borderline attempts should earn the lower tier.
   const finalScore = Math.min(
     100,
-    Math.max(0, Math.floor(rawScore * penaltyFactor * 100)),
+    Math.max(
+      0,
+      Math.floor(
+        rawScore *
+        penaltyFactor *
+        excessInkFactor *
+        wrongAreaPenaltyFactor *
+        trajectoryFactor *
+        100,
+      ),
+    ),
   );
 
   // ── 9. Star rating ─────────────────────────────────────────────────────────
-  // Children's thresholds — very encouraging:
-  //   3 ★  覆蓋 ≥ 60%   畫得出樣子就給三顆星
-  //   2 ★  覆蓋 ≥ 35%
-  //   1 ★  覆蓋 ≥ 12%   任何認真嘗試
-  //   0 ★  < 12%
+  // Coverage can never award a star by itself. Each tier has hard gates for
+  // precision, outside drawing and excess ink, so full-canvas scribbling fails
+  // even if it happens to cross much of the target. The thresholds remain
+  // forgiving because precision is measured against the dilated target.
+  const controlledAttempt =
+    outsideBoxRatio <= 0.62 &&
+    inkRatio <= 2.4 &&
+    (trajectory?.controlled ?? true);
+
   const stars: 0 | 1 | 2 | 3 =
-    overlapRatio >= 0.60 ? 3 :
-    overlapRatio >= 0.35 ? 2 :
-    overlapRatio >= 0.12 ? 1 :
+    controlledAttempt &&
+    finalScore >= 75 &&
+    overlapRatio >= 0.58 &&
+    precision >= 0.76 &&
+    wrongAreaRatio <= 0.24 &&
+    outsideBoxRatio <= 0.28 &&
+    inkRatio <= 1.45 &&
+    (trajectory?.directionStructure ?? 1) >= 0.99 ? 3 :
+    controlledAttempt &&
+    finalScore >= 48 &&
+    overlapRatio >= 0.34 &&
+    precision >= 0.56 &&
+    wrongAreaRatio <= 0.44 &&
+    outsideBoxRatio <= 0.38 &&
+    inkRatio <= 1.8 &&
+    (trajectory?.directionStructure ?? 1) >= 0.99 ? 2 :
+    controlledAttempt &&
+    finalScore >= 18 &&
+    overlapRatio >= 0.1 &&
+    precision >= 0.3 &&
+    wrongAreaRatio <= 0.7 &&
+    outsideBoxRatio <= 0.62 &&
+    (trajectory?.directionStructure ?? 1) >= 0.66 ? 1 :
     0;
 
   // ── 10. Debug log ──────────────────────────────────────────────────────────
@@ -332,12 +408,21 @@ export function calculateScore(
     targetPixels,
     userPixels,
     overlapPixels,
+    accurateUserPixels,
+    toleranceRadius,
     overlapRatio:    +overlapRatio.toFixed(4),
     precision:       +precision.toFixed(4),
     recall:          +recall.toFixed(4),
     rawScore:        +rawScore.toFixed(4),
     outsideBoxRatio: +outsideBoxRatio.toFixed(4),
     penaltyFactor:   +penaltyFactor.toFixed(4),
+    inkRatio:        +inkRatio.toFixed(4),
+    wrongAreaRatio:  +wrongAreaRatio.toFixed(4),
+    excessInkFactor: +excessInkFactor.toFixed(4),
+    wrongAreaPenaltyFactor: +wrongAreaPenaltyFactor.toFixed(4),
+    trajectoryFactor: +trajectoryFactor.toFixed(4),
+    trajectory,
+    controlledAttempt,
     finalScore,
     stars,
   });
@@ -352,5 +437,8 @@ export function calculateScore(
     userPixels,
     overlapPixels,
     outsideBoxRatio: +outsideBoxRatio.toFixed(4),
+    inkRatio:        +inkRatio.toFixed(4),
+    wrongAreaRatio:  +wrongAreaRatio.toFixed(4),
+    trajectory,
   };
 }

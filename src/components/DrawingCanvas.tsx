@@ -2,6 +2,11 @@
 
 import React, { useRef, useEffect, useState, useImperativeHandle, forwardRef, useCallback } from "react";
 import { ScoreResult, ZERO_SCORE, calculateScore } from "@/lib/scoring";
+import {
+  analyzeTrajectory,
+  StrokePath,
+  StrokePoint,
+} from "@/lib/trajectory";
 
 interface DrawingCanvasProps {
   letter: string;
@@ -23,6 +28,8 @@ const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>(
     const guideCanvasRef = useRef<HTMLCanvasElement>(null);
     const templateCanvasRef = useRef<HTMLCanvasElement | null>(null);
     const strokeCountRef = useRef(0); // strokes drawn so far
+    const strokesRef = useRef<StrokePath[]>([]);
+    const activeStrokeRef = useRef<StrokePath | null>(null);
     const [isDrawing, setIsDrawing] = useState(false);
 
     const buildTemplate = useCallback(async () => {
@@ -43,6 +50,10 @@ const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>(
       canvas.width = rect.width * dpr;
       canvas.height = rect.height * dpr;
       ctx.scale(dpr, dpr);
+      strokeCountRef.current = 0;
+      strokesRef.current = [];
+      activeStrokeRef.current = null;
+      onMetricsUpdate?.(ZERO_SCORE);
 
       // Drawing style
       ctx.lineJoin = "round";
@@ -109,10 +120,40 @@ const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>(
       gCtx.fillText(letter, cx + 1, cy + 1);
 
       gCtx.globalAlpha = 1;
-    }, [letter, fontSize, strokeWidth]);
+    }, [letter, fontSize, strokeWidth, onMetricsUpdate]);
 
     useEffect(() => {
       buildTemplate();
+    }, [buildTemplate]);
+
+    useEffect(() => {
+      const canvas = canvasRef.current;
+      if (!canvas || typeof ResizeObserver === "undefined") return;
+
+      let frame = 0;
+      const observer = new ResizeObserver(() => {
+        cancelAnimationFrame(frame);
+        frame = requestAnimationFrame(() => {
+          const rect = canvas.getBoundingClientRect();
+          const dpr = window.devicePixelRatio || 1;
+          const expectedWidth = Math.round(rect.width * dpr);
+          const expectedHeight = Math.round(rect.height * dpr);
+
+          if (
+            expectedWidth > 0 &&
+            expectedHeight > 0 &&
+            (canvas.width !== expectedWidth || canvas.height !== expectedHeight)
+          ) {
+            buildTemplate();
+          }
+        });
+      });
+
+      observer.observe(canvas);
+      return () => {
+        cancelAnimationFrame(frame);
+        observer.disconnect();
+      };
     }, [buildTemplate]);
 
     const computeMetrics = (): ScoreResult => {
@@ -134,7 +175,30 @@ const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>(
       const userImageData   = ctx.getImageData(0, 0, width, height);
       const targetImageData = tCtx.getImageData(0, 0, width, height);
 
-      return calculateScore(targetImageData, userImageData);
+      const rect = canvas.getBoundingClientRect();
+      const scaleX = width / Math.max(1, rect.width);
+      const scaleY = height / Math.max(1, rect.height);
+      const targetPixels = targetImageData.data;
+      const endpointRadius = Math.max(2, Math.round(Math.min(width, height) * 0.018));
+      const isNearTarget = (point: StrokePoint) => {
+        const px = Math.round(point.x * scaleX);
+        const py = Math.round(point.y * scaleY);
+        for (let y = Math.max(0, py - endpointRadius); y <= Math.min(height - 1, py + endpointRadius); y++) {
+          for (let x = Math.max(0, px - endpointRadius); x <= Math.min(width - 1, px + endpointRadius); x++) {
+            if (targetPixels[(y * width + x) * 4 + 3] > 128) return true;
+          }
+        }
+        return false;
+      };
+      const trajectory = analyzeTrajectory(
+        letter,
+        strokesRef.current,
+        rect.width,
+        rect.height,
+        isNearTarget,
+      );
+
+      return calculateScore(targetImageData, userImageData, trajectory);
     };
 
     useImperativeHandle(ref, () => ({
@@ -149,6 +213,8 @@ const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>(
         ctx.lineWidth = strokeWidth;
         ctx.strokeStyle = "#4338ca";
         strokeCountRef.current = 0; // reset stroke count
+        strokesRef.current = [];
+        activeStrokeRef.current = null;
       },
       getMetrics: computeMetrics,
     }));
@@ -172,6 +238,9 @@ const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>(
       const { x, y } = getCoords(e, rect);
       ctx.beginPath();
       ctx.moveTo(x, y);
+      const stroke: StrokePath = [{ x, y, time: performance.now() }];
+      activeStrokeRef.current = stroke;
+      strokesRef.current.push(stroke);
       setIsDrawing(true);
     };
 
@@ -185,11 +254,13 @@ const DrawingCanvas = forwardRef<DrawingCanvasHandle, DrawingCanvasProps>(
       const { x, y } = getCoords(e, rect);
       ctx.lineTo(x, y);
       ctx.stroke();
+      activeStrokeRef.current?.push({ x, y, time: performance.now() });
     };
 
     const stopDrawing = () => {
       if (!isDrawing) return;
       setIsDrawing(false);
+      activeStrokeRef.current = null;
       strokeCountRef.current += 1; // count each pen-lift as one stroke
       if (onMetricsUpdate) {
         onMetricsUpdate(computeMetrics());
